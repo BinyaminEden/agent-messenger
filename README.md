@@ -1,6 +1,6 @@
 # MCP Agent Messenger
 
-Enable Cursor AI agents to communicate with each other across sessions and repositories.
+Enable AI agents to communicate with each other across sessions and repositories. Works with any MCP-compatible client — Cursor, Claude Code, Windsurf, and more.
 
 ## How It Works
 
@@ -20,18 +20,18 @@ send-and-wait("Hello!")              wait_for_messages()
 
 ## Two Ways to Use
 
-| | MCP (Option A) | Skill / CLI (Option B) |
+| | MCP (Option A) | Skill + CLI (Option B) |
 |--|----------------|------------------------|
-| Setup | Add to `mcp.json`, restart | None (or copy skill to `~/.cursor/skills/`) |
+| Setup | Add to MCP config, restart | Copy skill to skills directory |
 | Approval popups | None (pre-approved) | Needs auto-run / yolo mode |
-| Best for | Default Cursor settings | Users with auto-run enabled |
+| Best for | Any MCP client (Cursor, Claude Code, Windsurf, etc.) | Any agent with skills support |
 | Same data? | Yes | Yes - fully interchangeable |
 
 ## Option A: MCP Server
 
 ### Quick Install (npx)
 
-Add to `~/.cursor/mcp.json`:
+Add to your MCP config (e.g. `~/.cursor/mcp.json` for Cursor, `~/.claude/settings.json` for Claude Code):
 
 ```json
 {
@@ -44,7 +44,7 @@ Add to `~/.cursor/mcp.json`:
 }
 ```
 
-Restart Cursor. That's it.
+Restart your client. That's it.
 
 ### From Source
 
@@ -55,7 +55,7 @@ npm install
 npm run build
 ```
 
-Add to `~/.cursor/mcp.json`:
+Add to your MCP config:
 
 ```json
 {
@@ -68,7 +68,7 @@ Add to `~/.cursor/mcp.json`:
 }
 ```
 
-Restart Cursor.
+Restart your client.
 
 ### Available Tools
 
@@ -76,18 +76,27 @@ Restart Cursor.
 
 ## Option B: Skill + CLI Script
 
-### 1. Copy the skill
+### 1. Install the skill
+
+Copy to your agent's skills directory:
 
 ```bash
+# Cursor
 cp -r skill/. ~/.cursor/skills/agent-comm/
+
+# Claude Code
+cp -r skill/. ~/.claude/skills/agent-comm/
+
+# Or use the universal path
+cp -r skill/. ~/.agents/skills/agent-comm/
 ```
 
 ### 2. Use via shell
 
 ```bash
-node ~/.cursor/skills/agent-comm/scripts/agent-comm.js register --name "MyAgent"
-node ~/.cursor/skills/agent-comm/scripts/agent-comm.js send-and-wait --from UUID --to UUID --message "Hello"
-node ~/.cursor/skills/agent-comm/scripts/agent-comm.js wait --uuid UUID --timeout 120
+node path/to/agent-messenger/skill/scripts/agent-comm.js register --name "MyAgent"
+node path/to/agent-messenger/skill/scripts/agent-comm.js send-and-wait --from UUID --to UUID --message "Hello"
+node path/to/agent-messenger/skill/scripts/agent-comm.js wait --uuid UUID --timeout 120
 ```
 
 No dependencies required - uses Node.js built-ins only.
