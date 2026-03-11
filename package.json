@@ -1,0 +1,43 @@
+{
+  "name": "mcp-agent-messenger",
+  "version": "1.0.0",
+  "description": "MCP server for cross-session agent-to-agent communication",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-agent-messenger": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "agent",
+    "communication",
+    "cursor"
+  ],
+  "author": "Binyamin Eden",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BinyaminEden/agent-messenger.git"
+  },
+  "bugs": {
+    "url": "https://github.com/BinyaminEden/agent-messenger/issues"
+  },
+  "homepage": "https://github.com/BinyaminEden/agent-messenger#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "proper-lockfile": "^4.1.2",
+    "uuid": "^9.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/uuid": "^9.0.0",
+    "typescript": "^5.0.0"
+  }
+}
