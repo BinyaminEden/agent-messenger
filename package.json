@@ -4,12 +4,29 @@
   "description": "MCP server for agent-to-agent and agent-to-group messaging",
   "type": "module",
   "main": "dist/src/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./store": {
+      "types": "./dist/src/store.d.ts",
+      "default": "./dist/src/store.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "mcp-agent-messenger": "dist/src/index.js"
   },
   "scripts": {
     "build": "npm run build:server",
     "build:server": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
     "start": "node dist/src/index.js",
     "dev": "tsc --watch -p tsconfig.json",
     "test": "npm run build:server && node --test dist/tests/**/*.test.js"
