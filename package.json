@@ -1,6 +1,6 @@
 {
   "name": "mcp-agent-messenger",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "MCP server for agent-to-agent and agent-to-group messaging",
   "type": "module",
   "main": "dist/src/index.js",
