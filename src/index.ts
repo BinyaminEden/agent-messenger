@@ -2,24 +2,54 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { fileURLToPath } from "url";
 import { z } from "zod";
-import { register, send, receive, waitForMessages } from "./store.js";
+import {
+  createGroup,
+  joinGroup,
+  leaveGroup,
+  listGroups,
+  receive,
+  registerAgent,
+  sendDirectMessage,
+  sendGroupMessage,
+  waitForMessages,
+} from "./store.js";
 
 let currentAgentUuid: string | null = null;
 
 const server = new McpServer({
   name: "agent-messenger",
-  version: "1.0.0",
+  version: "2.0.0",
 });
+
+function requireCurrentAgent() {
+  if (!currentAgentUuid) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({
+            success: false,
+            error: "You must register first using agent_register before using messaging tools.",
+          }),
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return null;
+}
 
 server.tool(
   "agent_register",
-  "Register this agent with the messaging system. Returns a unique UUID for this agent.",
+  "Register this agent with the messaging system. Returns a stable UUID for this agent.",
   {
     name: z.string().optional().describe("Human-readable name for this agent"),
   },
   async ({ name }) => {
-    const result = await register(name);
+    const result = await registerAgent(name);
     currentAgentUuid = result.uuid;
 
     return {
@@ -30,7 +60,8 @@ server.tool(
             {
               uuid: result.uuid,
               name: result.name,
-              message: `Registered successfully. Your UUID is ${result.uuid}. Share this with other agents who want to message you.`,
+              type: result.type,
+              message: `Registered successfully. Your UUID is ${result.uuid}. Share this with other agents who want to message you or add you to groups.`,
             },
             null,
             2
@@ -43,29 +74,18 @@ server.tool(
 
 server.tool(
   "agent_send",
-  "Send a message to another agent by their UUID. WARNING: After sending, you SHOULD call agent_wait_for_messages to wait for their reply. Consider using agent_send_and_wait instead which does both automatically.",
+  "Send a direct message to another participant by UUID.",
   {
-    to: z.string().describe("The recipient agent's UUID"),
+    to: z.string().describe("The recipient participant UUID"),
     message: z.string().describe("The message content to send"),
   },
   async ({ to, message }) => {
-    if (!currentAgentUuid) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              error:
-                "You must register first using agent_register before sending messages.",
-            }),
-          },
-        ],
-        isError: true,
-      };
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
     }
 
-    const result = await send(currentAgentUuid, to, message);
+    const result = await sendDirectMessage(currentAgentUuid!, to, message);
 
     return {
       content: [
@@ -81,32 +101,32 @@ server.tool(
 
 server.tool(
   "agent_receive",
-  "Check for pending messages and list active agents.",
+  "Check unread direct/group messages, joined groups, and active agents.",
   {
     clear: z
       .boolean()
       .optional()
       .default(true)
-      .describe("Whether to clear messages after reading (default: true)"),
+      .describe("Whether to mark unread messages as read (default: true)"),
   },
   async ({ clear }) => {
-    if (!currentAgentUuid) {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const result = await receive(currentAgentUuid!, clear);
+    if (!result) {
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              error:
-                "You must register first using agent_register before receiving messages.",
-            }),
+            text: JSON.stringify({ success: false, error: "Current agent not found" }),
           },
         ],
         isError: true,
       };
     }
-
-    const result = await receive(currentAgentUuid, clear);
 
     return {
       content: [
@@ -115,9 +135,12 @@ server.tool(
           text: JSON.stringify(
             {
               yourUuid: currentAgentUuid,
-              messageCount: result.messages.length,
-              messages: result.messages,
-              activeAgents: result.agents,
+              directMessageCount: result.directMessages.length,
+              groupMessageCount: result.groupMessages.length,
+              directMessages: result.directMessages,
+              groupMessages: result.groupMessages,
+              groups: result.groups,
+              activeAgents: result.activeAgents,
             },
             null,
             2
@@ -130,7 +153,7 @@ server.tool(
 
 server.tool(
   "agent_wait_for_messages",
-  "Wait for incoming messages. Blocks until a message arrives or timeout is reached. Use this to have real-time conversations with other agents.",
+  "Wait for unread direct or group messages. Blocks until traffic arrives or timeout is reached.",
   {
     timeout_seconds: z
       .number()
@@ -141,30 +164,31 @@ server.tool(
       .number()
       .optional()
       .default(2)
-      .describe("How often to check for new messages (default: 2 seconds)"),
+      .describe("How often to check for messages (default: 2 seconds)"),
   },
   async ({ timeout_seconds, poll_interval_seconds }) => {
-    if (!currentAgentUuid) {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const result = await waitForMessages(
+      currentAgentUuid!,
+      timeout_seconds * 1000,
+      poll_interval_seconds * 1000
+    );
+
+    if (!result) {
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              error:
-                "You must register first using agent_register before waiting for messages.",
-            }),
+            text: JSON.stringify({ success: false, error: "Current agent not found" }),
           },
         ],
         isError: true,
       };
     }
-
-    const result = await waitForMessages(
-      currentAgentUuid,
-      timeout_seconds * 1000,
-      poll_interval_seconds * 1000
-    );
 
     return {
       content: [
@@ -174,9 +198,12 @@ server.tool(
             {
               yourUuid: currentAgentUuid,
               timedOut: result.timedOut,
-              messageCount: result.messages.length,
-              messages: result.messages,
-              activeAgents: result.agents,
+              directMessageCount: result.directMessages.length,
+              groupMessageCount: result.groupMessages.length,
+              directMessages: result.directMessages,
+              groupMessages: result.groupMessages,
+              groups: result.groups,
+              activeAgents: result.activeAgents,
             },
             null,
             2
@@ -189,56 +216,48 @@ server.tool(
 
 server.tool(
   "agent_send_and_wait",
-  "PREFERRED METHOD: Send a message to another agent, then automatically wait for their reply. This is the correct way to have conversations - it ensures you don't leave the other agent waiting. Blocks until a reply arrives or timeout.",
+  "Send a direct message to another participant, then wait for unread direct or group traffic.",
   {
-    to: z.string().describe("The recipient agent's UUID"),
+    to: z.string().describe("The recipient participant UUID"),
     message: z.string().describe("The message content to send"),
     timeout_seconds: z
       .number()
       .optional()
       .default(120)
-      .describe("How long to wait for a reply (default: 120 seconds)"),
+      .describe("How long to wait for follow-up traffic (default: 120 seconds)"),
   },
   async ({ to, message, timeout_seconds }) => {
-    if (!currentAgentUuid) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              error:
-                "You must register first using agent_register before chatting.",
-            }),
-          },
-        ],
-        isError: true,
-      };
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
     }
 
-    const sendResult = await send(currentAgentUuid, to, message);
-    
+    const sendResult = await sendDirectMessage(currentAgentUuid!, to, message);
+
     if (!sendResult.success) {
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify({
-              success: false,
-              error: sendResult.error,
-              phase: "send",
-            }),
+            text: JSON.stringify({ success: false, error: sendResult.error, phase: "send" }),
           },
         ],
         isError: true,
       };
     }
 
-    const waitResult = await waitForMessages(
-      currentAgentUuid,
-      timeout_seconds * 1000,
-      2000
-    );
+    const waitResult = await waitForMessages(currentAgentUuid!, timeout_seconds * 1000, 2000);
+    if (!waitResult) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ success: false, error: "Current agent not found", phase: "wait" }),
+          },
+        ],
+        isError: true,
+      };
+    }
 
     return {
       content: [
@@ -250,9 +269,12 @@ server.tool(
               sentTo: to,
               sentMessage: message,
               timedOut: waitResult.timedOut,
-              replyCount: waitResult.messages.length,
-              replies: waitResult.messages,
-              activeAgents: waitResult.agents,
+              directReplyCount: waitResult.directMessages.length,
+              groupUpdateCount: waitResult.groupMessages.length,
+              directReplies: waitResult.directMessages,
+              groupUpdates: waitResult.groupMessages,
+              groups: waitResult.groups,
+              activeAgents: waitResult.activeAgents,
             },
             null,
             2
@@ -263,13 +285,149 @@ server.tool(
   }
 );
 
-async function main() {
+server.tool(
+  "agent_group_create",
+  "Create a new group and join it immediately.",
+  {
+    name: z.string().optional().describe("Optional human-readable group name"),
+  },
+  async ({ name }) => {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const result = await createGroup(currentAgentUuid!, name);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+      isError: !result.success,
+    };
+  }
+);
+
+server.tool(
+  "agent_group_join",
+  "Join a group by its UUID.",
+  {
+    group_uuid: z.string().describe("The group UUID to join"),
+  },
+  async ({ group_uuid }) => {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const result = await joinGroup(currentAgentUuid!, group_uuid);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+      isError: !result.success,
+    };
+  }
+);
+
+server.tool(
+  "agent_group_leave",
+  "Leave a joined group.",
+  {
+    group_uuid: z.string().describe("The group UUID to leave"),
+  },
+  async ({ group_uuid }) => {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const result = await leaveGroup(currentAgentUuid!, group_uuid);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+      isError: !result.success,
+    };
+  }
+);
+
+server.tool(
+  "agent_group_send",
+  "Send a message to a joined group.",
+  {
+    group_uuid: z.string().describe("The target group UUID"),
+    message: z.string().describe("The message content to send"),
+  },
+  async ({ group_uuid, message }) => {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const result = await sendGroupMessage(currentAgentUuid!, group_uuid, message);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+      isError: !result.success,
+    };
+  }
+);
+
+server.tool(
+  "agent_group_list",
+  "List the groups this agent has joined.",
+  {},
+  async () => {
+    const error = requireCurrentAgent();
+    if (error) {
+      return error;
+    }
+
+    const groups = await listGroups(currentAgentUuid!);
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify(
+            {
+              yourUuid: currentAgentUuid,
+              groups,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+export async function startMcpServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("Agent Messenger MCP server running on stdio");
 }
 
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
-});
+const isMainModule =
+  process.argv[1] !== undefined &&
+  fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isMainModule) {
+  startMcpServer().catch((error) => {
+    console.error("Fatal error:", error);
+    process.exit(1);
+  });
+}
