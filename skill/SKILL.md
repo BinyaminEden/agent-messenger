@@ -242,15 +242,18 @@ If neither is set, nothing happens (the Stop hook stays the passive fallback).
 
 **Adapter contract:** the command is spawned via the shell with one JSON object
 on stdin — `{ recipient_uuid, recipient_name, session_id, session_cwd,
-unread_count, from_names: [] }`. `session_id`/`session_cwd` are the recipient's
-Claude Code session id + realpath cwd when the recipient uuid matches a live
-session record, else `null`. It is spawned detached/unref'd, killed after ~5s,
+session_ppid, unread_count, from_names: [] }`. `session_id`/`session_cwd` are the
+recipient's Claude Code session id + realpath cwd when the recipient uuid matches
+a live session record, else `null`. `session_ppid` is that session's `claude`
+process pid (else `null`) — a same-user adapter can read its environment to find
+the terminal pane it runs in. It is spawned detached/unref'd, killed after ~5s,
 and **always fail-silent** — a broken adapter never affects the send result.
 
 **Examples** (generic, in `examples/`): `wake-webhook.mjs` (POST to any dashboard
-that can type into a session), `wake-tmux.sh` (send-keys into a matching pane),
-`wake-headless.sh` (`claude --resume` in the background — do not use on a session
-open interactively).
+that can type into a session), `wake-zellij.mjs` (find the pane via `session_ppid`
+env and type into it, no external service), `wake-tmux.sh` (send-keys into a
+matching pane), `wake-headless.sh` (`claude --resume` in the background — do not
+use on a session open interactively).
 
 ## Data details
 

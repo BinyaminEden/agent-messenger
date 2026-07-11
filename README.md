@@ -238,6 +238,7 @@ The command is spawned via the shell with one JSON object on **stdin**:
   "recipient_name": "…",
   "session_id": "…or null",
   "session_cwd": "…or null",
+  "session_ppid": 12345,
   "unread_count": 3,
   "from_names": ["Alice", "Bob"]
 }
@@ -246,6 +247,11 @@ The command is spawned via the shell with one JSON object on **stdin**:
 - `session_id` is the recipient's Claude Code session id when the recipient uuid
   matches a live session record (SessionStart hook), else `null`.
 - `session_cwd` is that session's realpath cwd, else `null`.
+- `session_ppid` is the pid of the recipient's `claude` process (the SessionStart
+  hook's parent pid), else `null`. A same-user adapter can inspect that process's
+  environment (e.g. `ps eww -o command= -p <ppid>` on macOS) to discover the
+  terminal pane it runs in — waking an idle pane directly, with no external
+  service. See `examples/wake-zellij.mjs`.
 - `from_names` are the distinct display names of the senders of the unread messages.
 
 The adapter is spawned **detached** and **unref**'d, killed after ~5s, and is
@@ -254,11 +260,17 @@ result or surfaces as a tool error.
 
 ### Example adapters
 
-Three illustrative, self-contained adapters live in `examples/` (all generic):
+Four illustrative, self-contained adapters live in `examples/` (all generic):
 
 - **`examples/wake-webhook.mjs`** — POSTs `{ session_id, text, submit: true }` to
   a URL from `WAKE_WEBHOOK_URL` (or the first CLI arg); skips when `session_id`
   is null. Works with any dashboard/bridge that can type into a session by id.
+- **`examples/wake-zellij.mjs`** — no external service. Reads `session_ppid` from
+  the payload, extracts `ZELLIJ_SESSION_NAME` + `ZELLIJ_PANE_ID` from that
+  process's environment (`ps eww`), and types the wake into the pane. With a
+  zellij pipe plugin (`WAKE_ZELLIJ_PIPE_PLUGIN`) it targets the pane WITHOUT
+  stealing focus; otherwise it falls back to `zellij action write-chars`, which
+  types into the focused pane (see its header for the plugin payload contract).
 - **`examples/wake-tmux.sh`** — finds a tmux pane whose cwd matches `session_cwd`
   and `send-keys` a "check your agent messages" prompt (cwd→pane matching is
   heuristic; adapt to your setup).

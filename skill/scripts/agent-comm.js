@@ -259,8 +259,8 @@ function withLock(fn) {
 // if the recipient stays idle with unread mail, invoke a user-configured command
 // (env AGENT_MESSENGER_WAKE_CMD, else `wakeCommand` in <data dir>/config.json).
 // It receives one JSON object on stdin (recipient_uuid, recipient_name,
-// session_id, session_cwd, unread_count, from_names). This file has ZERO
-// knowledge of any specific terminal/dashboard stack.
+// session_id, session_cwd, session_ppid, unread_count, from_names). This file
+// has ZERO knowledge of any specific terminal/dashboard stack.
 //
 // NOTE: unlike the long-lived MCP server (which debounces via an unref'd timer),
 // this CLI is short-lived and cannot hold a timer past process exit, so it fires
@@ -335,6 +335,7 @@ function gatherRecipientInfo(data, uuid) {
     recipient_name: (data.participants[uuid] && data.participants[uuid].name) || uuid,
     session_id: session ? uuid : null,
     session_cwd: (session && session.cwd) || null,
+    session_ppid: (session && typeof session.ppid === 'number') ? session.ppid : null,
     unread_count: unread,
     from_names: fromNames,
   };

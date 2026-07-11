@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, realpath as realpathAsync, rm, stat, writeFile } from 'node:fs/promises';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -14,6 +14,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const INBOX_HOOK = path.join(REPO_ROOT, 'skill', 'scripts', 'inbox-hook.js');
 const SESSION_HOOK = path.join(REPO_ROOT, 'skill', 'scripts', 'session-hook.js');
+const WAKE_ZELLIJ = path.join(REPO_ROOT, 'examples', 'wake-zellij.mjs');
 
 function runSessionHook(dir: string, input: Record<string, unknown>): { stdout: string } {
   const env: Record<string, string | undefined> = { ...process.env, AGENT_MESSENGER_DATA_DIR: dir };
@@ -928,6 +929,8 @@ test('wake adapter fires once with the recipient session id after the delay', as
       assert.equal(lines[0].recipient_uuid, sessionId);
       assert.equal(lines[0].session_id, sessionId);
       assert.equal(lines[0].session_cwd, await realpathAsync(dir));
+      // The session hook records its parent pid (this test runner spawned it).
+      assert.equal(lines[0].session_ppid, process.pid);
       assert.equal(lines[0].unread_count, 1);
       assert.deepEqual(lines[0].from_names, ['Alice']);
     });
@@ -985,6 +988,7 @@ test('wake for a non-session recipient reports session_id null', async () => {
       assert.equal(lines[0].recipient_uuid, bob.uuid);
       assert.equal(lines[0].session_id, null);
       assert.equal(lines[0].session_cwd, null);
+      assert.equal(lines[0].session_ppid, null);
     });
   });
 });
@@ -1024,6 +1028,56 @@ test('no wake configured does nothing and sends still succeed', async () => {
       assert.equal(readWakeLines(out).length, 0);
     });
   });
+});
+
+// The real examples/wake-zellij.mjs must exit 0 without touching zellij when the
+// target process (session_ppid) is not inside a Zellij pane.
+test('wake-zellij adapter exits silently when the target has no Zellij env', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'agent-messenger-wz-'));
+  try {
+    // A fake `zellij` first on PATH that records any invocation. If the adapter
+    // ever shells out to zellij, this log appears and the assertion fails.
+    const binDir = path.join(dir, 'fakebin');
+    mkdirSync(binDir, { recursive: true });
+    const zellijLog = path.join(dir, 'zellij-invocations.log');
+    const shim = path.join(binDir, 'zellij');
+    writeFileSync(shim, `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> ${JSON.stringify(zellijLog)}\nexit 0\n`);
+    chmodSync(shim, 0o755);
+
+    // A long-lived target process started WITHOUT any ZELLIJ_* env, so that
+    // `ps eww` on its pid reveals no Zellij pane — regardless of whether THIS
+    // test happens to be running inside a Zellij pane.
+    const cleanEnv: Record<string, string | undefined> = { ...process.env };
+    for (const key of Object.keys(cleanEnv)) {
+      if (key.startsWith('ZELLIJ')) delete cleanEnv[key];
+    }
+    const target = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      env: cleanEnv,
+      stdio: 'ignore',
+    });
+    try {
+      const event = {
+        recipient_uuid: 'sess',
+        recipient_name: 'Sess',
+        session_id: 'sess',
+        session_cwd: dir,
+        session_ppid: target.pid,
+        unread_count: 1,
+        from_names: ['Alice'],
+      };
+      const res = spawnSync(process.execPath, [WAKE_ZELLIJ], {
+        input: JSON.stringify(event),
+        env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+        encoding: 'utf8',
+      });
+      assert.equal(res.status, 0);
+      assert.equal(existsSync(zellijLog), false, 'zellij must not be invoked for a non-Zellij target');
+    } finally {
+      target.kill();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

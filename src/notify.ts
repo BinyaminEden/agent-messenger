@@ -28,6 +28,7 @@ import { spawn } from "child_process";
 interface SessionRecordLite {
   cwd?: string;
   uuid?: string;
+  ppid?: number;
 }
 
 export interface WakePayload {
@@ -38,6 +39,11 @@ export interface WakePayload {
   session_id: string | null;
   // The recipient session's cwd (realpath), else null.
   session_cwd: string | null;
+  // The pid of the recipient's `claude` process (SessionStart hook's parent pid),
+  // else null. Lets a same-user adapter locate the process — and, via its env,
+  // the terminal pane it runs in — without any external service. Null when the
+  // recipient has no live session record.
+  session_ppid: number | null;
   unread_count: number;
   // Distinct display names of the participants who sent the unread messages.
   from_names: string[];
@@ -226,6 +232,7 @@ async function gatherRecipientInfo(uuid: string): Promise<WakePayload | null> {
     recipient_name: participant?.name ?? uuid,
     session_id: session ? uuid : null,
     session_cwd: session?.cwd ?? null,
+    session_ppid: session?.ppid ?? null,
     unread_count: unread,
     from_names: fromNames,
   };
