@@ -62,12 +62,27 @@ The MCP server discovers which session it belongs to, in this priority order:
    (e.g. `mcp-agent-messenger-1a2b3c`). Same directory → same UUID across restarts.
 
 Session records live in `~/.agent-comm/identities.json` under `sessions`
-(`{session_id, cwd, name, uuid, ppid, updatedAt}`); SessionEnd removes a session's
-record while leaving its participant and messages intact (offline delivery keeps
-working). Without the hooks, nothing changes — the cwd/env fallback still applies.
+(`{session_id, cwd, name, uuid, ppid, updatedAt}`); SessionEnd moves a session's
+record into an `endedSessions` trail (kept ~24h, then pruned) while leaving its
+participant and messages intact (offline delivery keeps working). Without the
+hooks, nothing changes — the cwd/env fallback still applies.
 
 Call `agent_whoami` to see the resolved `{uuid, name, type}`, and `agent_register`
 only if you want to rename the current identity.
+
+### What happens on `/clear`
+
+`/clear` gives the pane a **new session UUID** (SessionStart fires with source
+`clear`). The SessionStart hook detects the predecessor (same parent PID + cwd,
+different session_id — found in `sessions` or the `endedSessions` trail, so it
+works regardless of whether SessionEnd for the old id ran first) and **hands the
+pane's address over**: the old participant is marked `aliasOf` the new one, its
+unread mail is re-targeted, and its group/channel memberships are copied across.
+Anyone who addresses the **old** UUID, name, or prefix is transparently
+forwarded to the live participant (chains flatten, so repeated clears stay
+depth-1), aliased participants drop out of `activeAgents`, and the running MCP
+server notices its cached identity was superseded and adopts the new one on its
+next tool call. Wakes for an old id poke the pane's *current* session.
 
 ### Addressing
 
@@ -136,7 +151,9 @@ ignored and never blocks the session):
 - **`skill/scripts/session-hook.js`** — a **SessionStart** + **SessionEnd** hook.
   On SessionStart it registers a participant whose UUID is the Claude Code session
   UUID and records the session (with its parent PID) so the MCP server can find
-  it. On SessionEnd it removes the session record (participant + messages stay).
+  it; it also runs the `/clear` identity handoff (see "What happens on `/clear`"
+  above). On SessionEnd it moves the session record into the `endedSessions` trail
+  (participant + messages stay).
 - **`skill/scripts/inbox-hook.js`** — a **Stop** hook. When the session tries to
   end, it checks the store (lock-free, never clearing anything) for unread
   messages addressed to this session (resolved by session UUID first) and, if any

@@ -24,6 +24,17 @@ across restarts in the same directory.
 
 Use `agent_whoami` to see the resolved identity; `agent_register` only to rename.
 
+### What happens on `/clear`
+
+`/clear` mints a **new session UUID** for the pane. The SessionStart hook detects
+the predecessor (same parent PID + cwd) and **hands your address over** to the new
+identity: unread mail is re-targeted, group/channel memberships are copied, and
+the old UUID/name/prefix is aliased forward so anyone messaging the old id still
+reaches you. Repeated clears flatten (they never chain deeply), the old identity
+drops out of `activeAgents`, and the running server adopts the new identity on its
+next tool call. You keep your inbox and memberships across `/clear` — nothing to
+do manually.
+
 ## Addressing
 
 Reference another participant by **name**, **full UUID**, or a **unique UUID
@@ -180,9 +191,10 @@ consuming.
 Two Claude Code hook scripts (both fail-open — they never break a session):
 
 - **`skill/scripts/session-hook.js`** — a **SessionStart** + **SessionEnd** hook.
-  SessionStart registers a participant whose UUID is the session UUID and records
-  the session (with parent PID) so the MCP server can discover it; SessionEnd
-  removes the session record (participant + messages stay for offline delivery).
+  SessionStart registers a participant whose UUID is the session UUID, records the
+  session (with parent PID) so the MCP server can discover it, and runs the
+  `/clear` identity handoff; SessionEnd moves the session record into a short
+  `endedSessions` trail (participant + messages stay for offline delivery).
 - **`skill/scripts/inbox-hook.js`** — a **Stop** hook that prevents a session from
   ending while it has unread messages. It resolves identity by session UUID first
   (then cwd/env fallbacks), reads the store lock-free, never clears anything, and

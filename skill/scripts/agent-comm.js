@@ -296,6 +296,8 @@ function readSessionRecord(uuid) {
 }
 
 function gatherRecipientInfo(data, uuid) {
+  // If a wake targets a superseded uuid, poke the pane's live session instead.
+  uuid = resolveAliasedUuid(data.participants, uuid);
   const nameOf = (senderUuid) =>
     (data.participants[senderUuid] && data.participants[senderUuid].name) || senderUuid;
 
@@ -397,6 +399,7 @@ function asActiveAgents(data, presence) {
   return Object.values(data.participants)
     .filter((participant) => {
       if (participant.type !== 'agent') return false;
+      if (participant.aliasOf) return false; // superseded (aliased) — hide it.
       const entry = presence[participant.uuid];
       return Boolean(entry) && now - entry.lastSeen < ACTIVE_PRESENCE_TTL_MS;
     })
@@ -468,7 +471,7 @@ function groupsForParticipant(data, participantUuid) {
       const members = Object.entries(group.members)
         .map(([memberUuid, membership]) => {
           const participant = data.participants[memberUuid];
-          if (!participant) return null;
+          if (!participant || participant.aliasOf) return null;
           return {
             uuid: memberUuid,
             type: participant.type,
@@ -550,15 +553,17 @@ function persistIdentity(cwd, identity) {
     } catch {}
     let identities = {};
     let sessions = {};
+    let endedSessions = {};
     try {
       const parsed = JSON.parse(fs.readFileSync(IDENTITY_FILE, 'utf8'));
       identities = (parsed && parsed.identities) || {};
-      // Preserve session records written by the SessionStart hook.
+      // Preserve session + ended-session records written by the session hook.
       sessions = (parsed && parsed.sessions) || {};
+      endedSessions = (parsed && parsed.endedSessions) || {};
     } catch {}
     identities[key] = { uuid: identity.uuid, name: identity.name, cwd: key, updatedAt: Date.now() };
     const tmp = `${IDENTITY_FILE}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ version: 1, identities, sessions }, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, identities, sessions, endedSessions }, null, 2));
     fs.renameSync(tmp, IDENTITY_FILE);
   } catch {
     // best-effort
@@ -579,20 +584,45 @@ function resolveIdentity(cwd = process.cwd()) {
   return result;
 }
 
+// Follow a participant's aliasOf chain to the terminal (live) participant uuid.
+// Cycle-protected. Lets an OLD address (pre-/clear) reach the live pane.
+function resolveAliasedUuid(participants, uuid) {
+  let current = uuid;
+  const seen = new Set();
+  for (let hop = 0; hop < 32; hop += 1) {
+    const participant = participants[current];
+    if (!participant || !participant.aliasOf || participant.aliasOf === current) {
+      return current;
+    }
+    if (seen.has(current) || !participants[participant.aliasOf]) {
+      return current;
+    }
+    seen.add(current);
+    current = participant.aliasOf;
+  }
+  return current;
+}
+
 // mirror of resolveParticipantRef — pure read, no lock. Resolves by exact uuid,
 // exact name, then a unique UUID prefix (min 6 chars, the statusline short id).
+// Any match is forwarded through its aliasOf chain to the live participant.
 const MIN_UUID_PREFIX = 6;
 function resolveRef(ref) {
   const data = readData();
+  const live = (uuid) => ({ uuid: resolveAliasedUuid(data.participants, uuid) });
   if (data.participants[ref]) {
-    return { uuid: ref };
+    return live(ref);
   }
 
   const nameMatches = Object.values(data.participants).filter((participant) => participant.name === ref);
   if (nameMatches.length === 1) {
-    return { uuid: nameMatches[0].uuid };
+    return live(nameMatches[0].uuid);
   }
   if (nameMatches.length > 1) {
+    const liveUuids = new Set(nameMatches.map((m) => resolveAliasedUuid(data.participants, m.uuid)));
+    if (liveUuids.size === 1) {
+      return { uuid: [...liveUuids][0] };
+    }
     return { error: `Ambiguous name '${ref}' → uuids: ${nameMatches.map((m) => m.uuid).join(', ')}` };
   }
 
@@ -603,9 +633,13 @@ function resolveRef(ref) {
     return { error: `UUID prefix '${ref}' too short (min ${MIN_UUID_PREFIX} chars)` };
   }
   if (ref.length >= MIN_UUID_PREFIX && prefixMatches.length === 1) {
-    return { uuid: prefixMatches[0].uuid };
+    return live(prefixMatches[0].uuid);
   }
   if (ref.length >= MIN_UUID_PREFIX && prefixMatches.length > 1) {
+    const liveUuids = new Set(prefixMatches.map((m) => resolveAliasedUuid(data.participants, m.uuid)));
+    if (liveUuids.size === 1) {
+      return { uuid: [...liveUuids][0] };
+    }
     return { error: `Ambiguous UUID prefix '${ref}' → uuids: ${prefixMatches.map((m) => m.uuid).join(', ')}` };
   }
 

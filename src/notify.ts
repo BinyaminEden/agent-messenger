@@ -140,10 +140,32 @@ async function resolveWakeCommand(): Promise<string | null> {
 }
 
 interface RawStoreLite {
-  participants?: Record<string, { uuid: string; name: string }>;
+  participants?: Record<string, { uuid: string; name: string; aliasOf?: string }>;
   groups?: Record<string, { uuid: string; members?: Record<string, { lastReadSequence?: number }> }>;
   directMessages?: Array<{ to: string; from: string; readAt: number | null }>;
   groupMessages?: Array<{ groupUuid: string; from: string; sequence: number }>;
+}
+
+// Follow a participant's aliasOf chain to the live participant (cycle-protected)
+// so a wake scheduled for a pre-/clear uuid pokes the pane's CURRENT session.
+function resolveAlias(
+  participants: Record<string, { aliasOf?: string }>,
+  uuid: string
+): string {
+  let current = uuid;
+  const seen = new Set<string>();
+  for (let hop = 0; hop < 32; hop += 1) {
+    const participant = participants[current];
+    if (!participant || !participant.aliasOf || participant.aliasOf === current) {
+      return current;
+    }
+    if (seen.has(current) || !participants[participant.aliasOf]) {
+      return current;
+    }
+    seen.add(current);
+    current = participant.aliasOf;
+  }
+  return current;
 }
 
 // Lock-free read of the store's unread state for one recipient, plus its session
@@ -161,6 +183,8 @@ async function gatherRecipientInfo(uuid: string): Promise<WakePayload | null> {
   const directMessages = data.directMessages ?? [];
   const groupMessages = data.groupMessages ?? [];
 
+  // If a wake was scheduled for a superseded uuid, poke the live pane instead.
+  uuid = resolveAlias(participants, uuid);
   const participant = participants[uuid];
   const nameOf = (senderUuid: string): string => participants[senderUuid]?.name ?? senderUuid;
 

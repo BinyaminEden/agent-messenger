@@ -12,6 +12,11 @@ export interface Participant {
   type: ParticipantType;
   name: string;
   createdAt: number;
+  // When set, this participant has been superseded (e.g. its pane was /clear'd,
+  // minting a new session_id) and its address forwards to the live participant
+  // `aliasOf`. Aliased participants are hidden from active-agent listings; refs
+  // that resolve to them follow the chain to the live participant.
+  aliasOf?: string;
 }
 
 export interface Presence {
@@ -90,11 +95,21 @@ export interface SessionRecord {
   stale?: boolean;
 }
 
+// A session record moved out of the live `sessions` map when SessionEnd fires,
+// kept as a short trail so a later SessionStart (e.g. the /clear replacement)
+// can still discover its predecessor even though the live record is gone.
+// Pruned after ENDED_SESSION_TTL_MS.
+export interface EndedSessionRecord extends SessionRecord {
+  endedAt: number;
+}
+
 export interface IdentityStore {
   version: 1;
   identities: Record<string, IdentityRecord>;
   // session_id -> session identity (written by the SessionStart hook).
   sessions?: Record<string, SessionRecord>;
+  // session_id -> ended session identity (SessionEnd trail; predecessor lookup).
+  endedSessions?: Record<string, EndedSessionRecord>;
 }
 
 interface LegacyAgent {
@@ -377,6 +392,36 @@ async function readSessionRecords(): Promise<Record<string, SessionRecord>> {
   }
 }
 
+async function readEndedSessionRecords(): Promise<Record<string, EndedSessionRecord>> {
+  try {
+    const content = await fs.readFile(IDENTITY_FILE, "utf-8");
+    const parsed = JSON.parse(content) as Partial<IdentityStore> | undefined;
+    return parsed?.endedSessions ?? {};
+  } catch {
+    return {};
+  }
+}
+
+// Follow a participant's aliasOf chain to the terminal (live, non-aliased)
+// participant uuid. Cycle-protected: bounded hops + a visited set, so a corrupt
+// self- or mutual-alias never loops. Falls back to the last resolvable uuid.
+function resolveAliasedUuid(participants: Record<string, Participant>, uuid: string): string {
+  let current = uuid;
+  const seen = new Set<string>();
+  for (let hop = 0; hop < 32; hop += 1) {
+    const participant = participants[current];
+    if (!participant || !participant.aliasOf || participant.aliasOf === current) {
+      return current;
+    }
+    if (seen.has(current) || !participants[participant.aliasOf]) {
+      return current;
+    }
+    seen.add(current);
+    current = participant.aliasOf;
+  }
+  return current;
+}
+
 // Discover WHICH session this MCP server process belongs to, using the records
 // the SessionStart hook persisted. Priority:
 //   (1) session whose ppid matches this process's parent pid — hook and stdio
@@ -426,10 +471,11 @@ async function persistIdentity(
       updatedAt: Date.now(),
     };
 
-    // Preserve the session records the SessionStart hook wrote — this best-effort
-    // write must never clobber them.
+    // Preserve the session + ended-session records the hooks wrote — this
+    // best-effort write must never clobber them.
     const sessions = await readSessionRecords();
-    const store: IdentityStore = { version: 1, identities, sessions };
+    const endedSessions = await readEndedSessionRecords();
+    const store: IdentityStore = { version: 1, identities, sessions, endedSessions };
     const tempFile = `${IDENTITY_FILE}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
     await fs.writeFile(tempFile, JSON.stringify(store, null, 2));
     await fs.rename(tempFile, IDENTITY_FILE);
@@ -644,6 +690,11 @@ function activeAgentsFromData(
       if (participant.type !== "agent") {
         return false;
       }
+      // Aliased (superseded) participants are hidden — their live successor is
+      // the one that should appear as active.
+      if (participant.aliasOf) {
+        return false;
+      }
       const entry = presence[participant.uuid];
       return Boolean(entry) && now - entry.lastSeen < ACTIVE_PRESENCE_TTL_MS;
     })
@@ -737,7 +788,7 @@ function groupsForParticipant(data: StoreData, participantUuid: string): GroupSu
       const members = Object.entries(group.members)
         .map(([memberUuid, membership]) => {
           const participant = data.participants[memberUuid];
-          if (!participant) {
+          if (!participant || participant.aliasOf) {
             return null;
           }
 
@@ -872,6 +923,125 @@ export async function resolveIdentity(cwd: string = process.cwd()): Promise<Regi
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Identity handoff (/clear survival).
+//
+// When a pane is /clear'd, Claude Code mints a NEW session_id for it. The
+// SessionStart hook detects the predecessor(s) (same ppid + cwd, different
+// session_id) and hands the pane's address over to the new participant. This is
+// the store-level mirror of that logic — the standalone session-hook.js runs the
+// same steps out-of-process, and the MCP server (refreshIdentity) uses it as a
+// self-healing safety net when it notices its cached session was superseded.
+// ---------------------------------------------------------------------------
+
+// Migrate one superseded predecessor onto the live participant, in place.
+// Returns true when anything changed. Idempotent: re-running is a no-op.
+function handoffPredecessor(data: StoreData, oldUuid: string, newUuid: string): boolean {
+  if (oldUuid === newUuid) {
+    return false;
+  }
+  const predecessor = data.participants[oldUuid];
+  const successor = data.participants[newUuid];
+  if (!predecessor || !successor) {
+    return false;
+  }
+
+  // Successor must be terminal.
+  if (successor.aliasOf) {
+    delete successor.aliasOf;
+  }
+
+  // 1. Alias the predecessor forward.
+  predecessor.aliasOf = newUuid;
+
+  // 2. Re-target the predecessor's UNREAD direct mail to the successor.
+  for (const message of data.directMessages) {
+    if (message.to === oldUuid && message.readAt === null) {
+      message.to = newUuid;
+    }
+  }
+
+  // 3. Copy group/channel memberships, merging read state so no unread is lost.
+  for (const group of Object.values(data.groups)) {
+    const oldMembership = group.members[oldUuid];
+    if (!oldMembership) {
+      continue;
+    }
+    const newMembership = group.members[newUuid];
+    if (!newMembership) {
+      group.members[newUuid] = {
+        joinedAt: oldMembership.joinedAt,
+        lastReadSequence: oldMembership.lastReadSequence,
+      };
+    } else {
+      newMembership.joinedAt = Math.min(newMembership.joinedAt, oldMembership.joinedAt);
+      newMembership.lastReadSequence = Math.min(
+        newMembership.lastReadSequence,
+        oldMembership.lastReadSequence
+      );
+    }
+    delete group.members[oldUuid];
+  }
+
+  // 4. Flatten: any alias that pointed at the predecessor now points straight at
+  //    the successor, keeping chains at depth 1 (eab→4f8→c29 collapses).
+  for (const participant of Object.values(data.participants)) {
+    if (participant.aliasOf === oldUuid) {
+      participant.aliasOf = newUuid;
+    }
+  }
+
+  return true;
+}
+
+// Hand a pane's address from one or more superseded predecessors to the live
+// participant. Locked (mutates data.json). Safe to call repeatedly.
+export async function applyIdentityHandoff(
+  predecessorUuids: string[],
+  newUuid: string
+): Promise<void> {
+  const unique = [...new Set(predecessorUuids.filter((uuid) => uuid && uuid !== newUuid))];
+  if (unique.length === 0) {
+    return;
+  }
+
+  await withLock(async () => {
+    const data = await readData();
+    if (!data.participants[newUuid]) {
+      return;
+    }
+    let changed = false;
+    for (const oldUuid of unique) {
+      changed = handoffPredecessor(data, oldUuid, newUuid) || changed;
+    }
+    if (changed) {
+      await writeData(data);
+    }
+  });
+}
+
+// Cheap re-resolution for the long-lived MCP server's cached identity. Called on
+// each tool use: if the pane got a NEW session_id (freshest ppid/cwd-matched
+// session record differs from the cache — e.g. after /clear) adopt it, running a
+// self-healing handoff in case the hook's did not. Otherwise, if the cached
+// participant has since been aliased, follow the alias to the live participant.
+// Both are small lock-free reads on the common (unchanged) path.
+export async function refreshIdentity(
+  cachedUuid: string,
+  cwd: string = process.cwd()
+): Promise<string> {
+  const session = await findServerSession(cwd);
+  if (session && session.uuid !== cachedUuid) {
+    const result = await registerParticipant("agent", session.name, session.uuid);
+    await applyIdentityHandoff([cachedUuid], result.uuid);
+    await persistIdentity(cwd, result);
+    return result.uuid;
+  }
+
+  const data = await readData();
+  return resolveAliasedUuid(data.participants, cachedUuid);
+}
+
 // Minimum length for a UUID-prefix address. Shorter prefixes are rejected to
 // avoid accidental collisions; this matches the short id shown in the statusline.
 const MIN_UUID_PREFIX = 6;
@@ -881,9 +1051,15 @@ export async function resolveParticipantRef(
 ): Promise<{ uuid: string } | { error: string }> {
   const data = await readData();
 
+  // Any resolved uuid is forwarded through its aliasOf chain so addressing a
+  // pane by an OLD uuid/name/prefix (pre-/clear) reaches its live participant.
+  const live = (uuid: string): { uuid: string } => ({
+    uuid: resolveAliasedUuid(data.participants, uuid),
+  });
+
   // Exact UUID always wins.
   if (data.participants[ref]) {
-    return { uuid: ref };
+    return live(ref);
   }
 
   // Exact name next (names remain the primary human-facing address).
@@ -891,9 +1067,15 @@ export async function resolveParticipantRef(
     (participant) => participant.name === ref
   );
   if (nameMatches.length === 1) {
-    return { uuid: nameMatches[0].uuid };
+    return live(nameMatches[0].uuid);
   }
   if (nameMatches.length > 1) {
+    const liveUuids = new Set(
+      nameMatches.map((match) => resolveAliasedUuid(data.participants, match.uuid))
+    );
+    if (liveUuids.size === 1) {
+      return { uuid: [...liveUuids][0] };
+    }
     return {
       error: `Ambiguous name '${ref}' → uuids: ${nameMatches
         .map((match) => match.uuid)
@@ -911,9 +1093,15 @@ export async function resolveParticipantRef(
     };
   }
   if (ref.length >= MIN_UUID_PREFIX && prefixMatches.length === 1) {
-    return { uuid: prefixMatches[0].uuid };
+    return live(prefixMatches[0].uuid);
   }
   if (ref.length >= MIN_UUID_PREFIX && prefixMatches.length > 1) {
+    const liveUuids = new Set(
+      prefixMatches.map((match) => resolveAliasedUuid(data.participants, match.uuid))
+    );
+    if (liveUuids.size === 1) {
+      return { uuid: [...liveUuids][0] };
+    }
     return {
       error: `Ambiguous UUID prefix '${ref}' → uuids: ${prefixMatches
         .map((match) => match.uuid)

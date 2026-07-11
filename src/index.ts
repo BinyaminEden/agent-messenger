@@ -12,6 +12,7 @@ import {
   leaveGroup,
   listGroups,
   receive,
+  refreshIdentity,
   registerParticipant,
   replyToMessage,
   resolveIdentity,
@@ -37,12 +38,17 @@ const server = new McpServer({
   version: "3.0.0",
 });
 
-// Resolve (once) the identity for a session. Subsequent calls reuse the cached
-// uuid so a rename via agent_register is never silently undone.
+// Resolve the identity for a session. The first call pins it; later calls reuse
+// the cached uuid so a rename via agent_register is never silently undone — but
+// cheaply re-check for a /clear handoff: if the pane got a new session_id, or the
+// cached participant was aliased onto a successor, adopt the live identity so the
+// running server stops acting as the stale pre-clear uuid.
 export async function resolveSessionAgent(state: AgentSession): Promise<string> {
   if (!state.uuid) {
     state.uuid = (await resolveIdentity()).uuid;
+    return state.uuid;
   }
+  state.uuid = await refreshIdentity(state.uuid);
   return state.uuid;
 }
 

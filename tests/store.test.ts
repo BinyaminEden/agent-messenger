@@ -31,6 +31,16 @@ function readSessions(dir: string): Record<string, any> {
   return (parsed && parsed.sessions) || {};
 }
 
+function readEndedSessions(dir: string): Record<string, any> {
+  const parsed = JSON.parse(readFileSync(path.join(dir, 'identities.json'), 'utf8'));
+  return (parsed && parsed.endedSessions) || {};
+}
+
+function readParticipants(dir: string): Record<string, any> {
+  const parsed = JSON.parse(readFileSync(path.join(dir, 'data.json'), 'utf8'));
+  return (parsed && parsed.participants) || {};
+}
+
 function deriveIdentityName(cwd: string): string {
   const hash = crypto.createHash('sha256').update(cwd).digest('hex').slice(0, 6);
   return `${path.basename(cwd)}-${hash}`;
@@ -1014,6 +1024,148 @@ test('no wake configured does nothing and sends still succeed', async () => {
       assert.equal(readWakeLines(out).length, 0);
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// Identity handoff on /clear (predecessor detection + alias migration).
+// ---------------------------------------------------------------------------
+
+test('/clear hands a pane its predecessor mail, memberships, and address (SessionEnd-first ordering)', async () => {
+  await withStore(async (store, dir) => {
+    const previousName = process.env.AGENT_MESSENGER_NAME;
+    delete process.env.AGENT_MESSENGER_NAME;
+
+    // A real dir so ppid + realpath(cwd) key the pane across hook invocations.
+    const paneDir = await mkdtemp(path.join(tmpdir(), 'agent-messenger-clear-'));
+    try {
+      const A = crypto.randomUUID();
+      const B = crypto.randomUUID();
+
+      // Session A starts, receives durable mail, and joins a channel.
+      runSessionHook(dir, { session_id: A, cwd: paneDir, hook_event_name: 'SessionStart', source: 'startup' });
+      const sender = await store.registerAgent('Sender');
+      await store.sendDirectMessage(sender.uuid, A, 'pre-clear mail');
+      await store.joinChannel(A, 'clear-room');
+
+      // /clear: empirically SessionEnd(A) fires, THEN SessionStart(clear, B).
+      runSessionHook(dir, { session_id: A, cwd: paneDir, hook_event_name: 'SessionEnd', reason: 'clear' });
+      assert.ok(readEndedSessions(dir)[A], 'A moved to the endedSessions trail');
+      runSessionHook(dir, { session_id: B, cwd: paneDir, hook_event_name: 'SessionStart', source: 'clear' });
+
+      // Mail is readable by B (re-targeted, not stranded on A).
+      const inboxB = await store.receive(B, false);
+      assert.equal(inboxB?.directMessages.length, 1);
+      assert.equal(inboxB?.directMessages[0].content, 'pre-clear mail');
+
+      // Channel membership carried to B; A is not a member anymore.
+      const groupsB = await store.listGroups(B);
+      const room = groupsB.find((g) => g.name === 'clear-room');
+      assert.ok(room, 'B inherited the channel membership');
+      assert.ok(room!.members.some((m) => m.uuid === B));
+      assert.ok(!room!.members.some((m) => m.uuid === A));
+
+      // Addressing the OLD id (uuid prefix) resolves to the live pane B.
+      const ref = await store.resolveParticipantRef(A.slice(0, 8));
+      assert.deepEqual(ref, { uuid: B });
+
+      // A is aliased and hidden from active agents; B is present.
+      assert.equal(readParticipants(dir)[A].aliasOf, B);
+      const active = await store.listActiveAgents();
+      assert.ok(!active.some((a) => a.uuid === A), 'aliased A hidden from active agents');
+      assert.ok(active.some((a) => a.uuid === B), 'live B visible');
+
+      // The predecessor session record was consumed from the trail.
+      assert.equal(readEndedSessions(dir)[A], undefined);
+
+      // Second /clear B → C: transitive resolution + alias flattening.
+      const C = crypto.randomUUID();
+      runSessionHook(dir, { session_id: B, cwd: paneDir, hook_event_name: 'SessionEnd', reason: 'clear' });
+      runSessionHook(dir, { session_id: C, cwd: paneDir, hook_event_name: 'SessionStart', source: 'clear' });
+
+      // Both old ids resolve straight to C.
+      assert.deepEqual(await store.resolveParticipantRef(A.slice(0, 8)), { uuid: C });
+      assert.deepEqual(await store.resolveParticipantRef(B.slice(0, 8)), { uuid: C });
+
+      // Flattened: A points DIRECTLY at C (chain depth 1), not via B.
+      const participants = readParticipants(dir);
+      assert.equal(participants[A].aliasOf, C);
+      assert.equal(participants[B].aliasOf, C);
+
+      // Mail + membership followed all the way to C.
+      const inboxC = await store.receive(C, false);
+      assert.equal(inboxC?.directMessages.length, 1);
+      assert.equal(inboxC?.directMessages[0].content, 'pre-clear mail');
+      const groupsC = await store.listGroups(C);
+      assert.ok(groupsC.some((g) => g.name === 'clear-room'));
+    } finally {
+      await rm(paneDir, { recursive: true, force: true });
+      if (previousName === undefined) delete process.env.AGENT_MESSENGER_NAME;
+      else process.env.AGENT_MESSENGER_NAME = previousName;
+    }
+  });
+});
+
+test('/clear handoff also works when SessionStart runs before SessionEnd of the old id', async () => {
+  await withStore(async (store, dir) => {
+    const previousName = process.env.AGENT_MESSENGER_NAME;
+    delete process.env.AGENT_MESSENGER_NAME;
+
+    const paneDir = await mkdtemp(path.join(tmpdir(), 'agent-messenger-clear2-'));
+    try {
+      const A = crypto.randomUUID();
+      const B = crypto.randomUUID();
+
+      runSessionHook(dir, { session_id: A, cwd: paneDir, hook_event_name: 'SessionStart', source: 'startup' });
+      const sender = await store.registerAgent('Sender');
+      await store.sendDirectMessage(sender.uuid, A, 'race-order mail');
+
+      // Reverse ordering: SessionStart(B) fires while A's LIVE record still exists,
+      // then SessionEnd(A) arrives afterwards.
+      runSessionHook(dir, { session_id: B, cwd: paneDir, hook_event_name: 'SessionStart', source: 'clear' });
+      runSessionHook(dir, { session_id: A, cwd: paneDir, hook_event_name: 'SessionEnd', reason: 'clear' });
+
+      // Handoff still happened at SessionStart(B) from the live predecessor.
+      assert.equal(readParticipants(dir)[A].aliasOf, B);
+      const inboxB = await store.receive(B, false);
+      assert.equal(inboxB?.directMessages.length, 1);
+      assert.equal(inboxB?.directMessages[0].content, 'race-order mail');
+      assert.deepEqual(await store.resolveParticipantRef(A.slice(0, 8)), { uuid: B });
+    } finally {
+      await rm(paneDir, { recursive: true, force: true });
+      if (previousName === undefined) delete process.env.AGENT_MESSENGER_NAME;
+      else process.env.AGENT_MESSENGER_NAME = previousName;
+    }
+  });
+});
+
+test('index resolveSessionAgent swaps a cached identity that has been aliased by a handoff', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'agent-messenger-idx-'));
+  const previousDir = process.env.AGENT_MESSENGER_DATA_DIR;
+  process.env.AGENT_MESSENGER_DATA_DIR = dir;
+  try {
+    // Load index fresh; its internal `./store.js` import loads (first time) with
+    // this data dir, and the plain store handle below is the SAME instance.
+    const index = (await import(`../src/index.js?ts=${Date.now()}-${Math.random()}`)) as typeof import('../src/index.js');
+    const store = (await import('../src/store.js')) as typeof import('../src/store.js');
+
+    const a = await store.registerParticipant('agent', 'pane-A', 'aaaaaaaa-1111-1111-1111-111111111111');
+    const b = await store.registerParticipant('agent', 'pane-B', 'bbbbbbbb-2222-2222-2222-222222222222');
+
+    // A pane that cached identity A before it was superseded by B.
+    const state = { uuid: a.uuid };
+
+    // The /clear handoff aliases A onto B.
+    await store.applyIdentityHandoff([a.uuid], b.uuid);
+
+    // Next tool call must re-resolve the cache to the live successor.
+    const live = await index.resolveSessionAgent(state);
+    assert.equal(live, b.uuid);
+    assert.equal(state.uuid, b.uuid);
+  } finally {
+    if (previousDir === undefined) delete process.env.AGENT_MESSENGER_DATA_DIR;
+    else process.env.AGENT_MESSENGER_DATA_DIR = previousDir;
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('session-hook SessionEnd removes the session record but keeps the participant and messages', async () => {

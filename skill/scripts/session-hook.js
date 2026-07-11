@@ -179,7 +179,10 @@ function writePresence(uuid) {
   }
 }
 
-// Read the whole identities.json store (identities + sessions).
+// Trail retention for ended session records used in predecessor lookup.
+const ENDED_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Read the whole identities.json store (identities + sessions + endedSessions).
 function readIdentityStore() {
   try {
     const parsed = JSON.parse(fs.readFileSync(IDENTITY_FILE, 'utf8'));
@@ -187,9 +190,24 @@ function readIdentityStore() {
       version: 1,
       identities: (parsed && parsed.identities) || {},
       sessions: (parsed && parsed.sessions) || {},
+      endedSessions: (parsed && parsed.endedSessions) || {},
     };
   } catch {
-    return { version: 1, identities: {}, sessions: {} };
+    return { version: 1, identities: {}, sessions: {}, endedSessions: {} };
+  }
+}
+
+// Drop ended-session records older than the trail TTL.
+function pruneEndedSessions(store) {
+  if (!store.endedSessions) {
+    store.endedSessions = {};
+    return;
+  }
+  const now = Date.now();
+  for (const [sid, rec] of Object.entries(store.endedSessions)) {
+    if (!rec || typeof rec.endedAt !== 'number' || now - rec.endedAt > ENDED_SESSION_TTL_MS) {
+      delete store.endedSessions[sid];
+    }
   }
 }
 
@@ -220,18 +238,107 @@ function upsertSession(record) {
   }
 }
 
-// Remove this session's record on SessionEnd. The participant + its messages
-// stay so offline delivery keeps working.
+// On SessionEnd, MOVE this session's record into the `endedSessions` trail (with
+// a timestamp) rather than deleting it outright. Empirically a /clear removes the
+// old record before the replacement SessionStart runs; the trail lets the new
+// session still discover its predecessor. The participant + its messages stay so
+// offline delivery keeps working; the trail is pruned after ENDED_SESSION_TTL_MS.
 function removeSession(sessionId) {
   try {
     const store = readIdentityStore();
-    if (store.sessions[sessionId]) {
+    const record = store.sessions[sessionId];
+    if (record) {
       delete store.sessions[sessionId];
-      writeIdentityStore(store);
+      store.endedSessions[sessionId] = { ...record, endedAt: Date.now() };
     }
+    pruneEndedSessions(store);
+    writeIdentityStore(store);
   } catch {
     // best-effort
   }
+}
+
+// Find predecessor session records of THIS pane: same ppid + cwd, different
+// session_id. Unions live `sessions` with the `endedSessions` trail so the
+// handoff works whether or not SessionEnd for the old id ran first.
+function findPredecessors(store, sessionId, ppid, realCwd) {
+  const merged = { ...(store.endedSessions || {}), ...(store.sessions || {}) };
+  const preds = [];
+  const seen = new Set();
+  for (const rec of Object.values(merged)) {
+    if (!rec || !rec.session_id || rec.session_id === sessionId) continue;
+    if (rec.ppid !== ppid || rec.cwd !== realCwd) continue;
+    const uuid = rec.uuid || rec.session_id;
+    if (seen.has(uuid)) continue;
+    seen.add(uuid);
+    preds.push(rec);
+  }
+  return preds;
+}
+
+// Store-level handoff mirror (see src/store.ts handoffPredecessor). Migrate one
+// superseded predecessor participant onto the live one, in place on `data`.
+function handoffPredecessor(data, oldUuid, newUuid) {
+  if (oldUuid === newUuid) return false;
+  const predecessor = data.participants[oldUuid];
+  const successor = data.participants[newUuid];
+  if (!predecessor || !successor) return false;
+
+  if (successor.aliasOf) delete successor.aliasOf;
+
+  // 1. Alias the predecessor forward.
+  predecessor.aliasOf = newUuid;
+
+  // 2. Re-target the predecessor's UNREAD direct mail.
+  for (const message of data.directMessages) {
+    if (message.to === oldUuid && message.readAt === null) {
+      message.to = newUuid;
+    }
+  }
+
+  // 3. Copy group/channel memberships, merging read state (min → keep unread).
+  for (const group of Object.values(data.groups)) {
+    const oldMembership = group.members && group.members[oldUuid];
+    if (!oldMembership) continue;
+    const newMembership = group.members[newUuid];
+    if (!newMembership) {
+      group.members[newUuid] = {
+        joinedAt: oldMembership.joinedAt,
+        lastReadSequence: oldMembership.lastReadSequence || 0,
+      };
+    } else {
+      newMembership.joinedAt = Math.min(newMembership.joinedAt, oldMembership.joinedAt);
+      newMembership.lastReadSequence = Math.min(
+        newMembership.lastReadSequence || 0,
+        oldMembership.lastReadSequence || 0
+      );
+    }
+    delete group.members[oldUuid];
+  }
+
+  // 4. Flatten aliases that pointed at the predecessor onto the successor.
+  for (const participant of Object.values(data.participants)) {
+    if (participant.aliasOf === oldUuid) {
+      participant.aliasOf = newUuid;
+    }
+  }
+
+  return true;
+}
+
+// Run the handoff for a set of predecessor uuids under the data lock.
+function applyIdentityHandoff(oldUuids, newUuid) {
+  const unique = [...new Set(oldUuids.filter((u) => u && u !== newUuid))];
+  if (unique.length === 0) return;
+  withLock(() => {
+    const data = readData();
+    if (!data.participants[newUuid]) return;
+    let changed = false;
+    for (const oldUuid of unique) {
+      changed = handoffPredecessor(data, oldUuid, newUuid) || changed;
+    }
+    if (changed) writeData(data);
+  });
 }
 
 function main() {
@@ -268,14 +375,55 @@ function main() {
     return; // could not register — fail-open
   }
 
-  upsertSession({
-    session_id: sessionId,
-    cwd: realpath(cwd),
-    name: registered.name,
-    uuid: registered.uuid,
-    ppid: process.ppid,
-    updatedAt: Date.now(),
-  });
+  const realCwd = realpath(cwd);
+
+  // Identity handoff: if this pane was /clear'd, an older session with the same
+  // ppid + cwd but a different session_id is its predecessor. Hand its address
+  // (unread mail, group/channel memberships, aliasing) over to this session, so
+  // the pane keeps its inbox and anyone addressing the old id reaches the new one.
+  let predecessors = [];
+  try {
+    const store = readIdentityStore();
+    predecessors = findPredecessors(store, sessionId, process.ppid, realCwd);
+    if (predecessors.length > 0) {
+      applyIdentityHandoff(
+        predecessors.map((p) => p.uuid || p.session_id),
+        registered.uuid
+      );
+    }
+  } catch {
+    // best-effort: a failed handoff must not break session start.
+  }
+
+  // Upsert this session's record and CONSUME the predecessors' records (so a
+  // later clear does not reprocess them), pruning the trail while we hold it.
+  try {
+    const store = readIdentityStore();
+    for (const p of predecessors) {
+      delete store.sessions[p.session_id];
+      delete store.endedSessions[p.session_id];
+    }
+    pruneEndedSessions(store);
+    store.sessions[sessionId] = {
+      session_id: sessionId,
+      cwd: realCwd,
+      name: registered.name,
+      uuid: registered.uuid,
+      ppid: process.ppid,
+      updatedAt: Date.now(),
+    };
+    writeIdentityStore(store);
+  } catch {
+    // Fall back to the simple upsert if the combined write failed.
+    upsertSession({
+      session_id: sessionId,
+      cwd: realCwd,
+      name: registered.name,
+      uuid: registered.uuid,
+      ppid: process.ppid,
+      updatedAt: Date.now(),
+    });
+  }
 
   writePresence(registered.uuid);
 }
