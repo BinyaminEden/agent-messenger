@@ -87,8 +87,31 @@ next tool call. Wakes for an old id poke the pane's *current* session.
 ### Addressing
 
 Message a participant by **name**, **full UUID**, or a **unique UUID prefix**
-(minimum 6 chars — the short id shown in the statusline is directly usable).
-Ambiguous or too-short prefixes return a clear error.
+(minimum 6 chars). Ambiguous or too-short prefixes return a clear error.
+
+### Show your address in the status line
+
+Since a session's messaging UUID *is* its Claude Code session UUID, you can put
+each agent's address right on its status line — read it off one pane, tell any
+other agent to message it. The status line command receives JSON on stdin that
+includes `session_id`:
+
+```bash
+#!/bin/bash
+# ~/.claude/statusline.sh
+input=$(cat)
+sid=$(echo "$input" | jq -r '.session_id // ""')
+echo "✉ ${sid:0:8}  $(basename "$(echo "$input" | jq -r '.workspace.current_dir')")"
+```
+
+```json
+{
+  "statusLine": { "type": "command", "command": "~/.claude/statusline.sh" }
+}
+```
+
+The 8-char `✉` prefix is a complete, directly usable address (see
+[Addressing](#addressing)).
 
 ## Available MCP tools
 
